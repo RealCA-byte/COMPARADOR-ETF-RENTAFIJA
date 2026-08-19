@@ -1,0 +1,997 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+actualizar.py — Comparador de ETFs de renta fija + armador de portafolio
+========================================================================
+
+Universo fijo: los 39 ETFs UCITS acumulativos de la lista.
+
+Uso:
+    python actualizar.py              # baja datos frescos y regenera el HTML
+    python actualizar.py --solo-html  # regenera el HTML sin bajar nada
+
+Requisitos: pip install requests
+Archivos:   datos.json  ->  renta_fija.html
+
+Las tasas mexicanas (CETES y Bono M) se bajan del SIE de Banxico si pones un
+token gratuito en la variable de entorno BANXICO_TOKEN. Sin token conserva las
+guardadas, que de todos modos solo cambian con la subasta semanal.
+
+Nota: el contenedor donde se genero este script no tiene salida a internet, asi
+que la descarga NO fue probada en vivo. Si un emisor cambia el formato de su
+ficha, el script conserva el ultimo valor bueno y te dice cual fondo fallo.
+"""
+
+import argparse, json, os, re, sys, time
+from datetime import date, datetime
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Falta 'requests'. Instalala con:  pip install requests")
+
+AQUI = os.path.dirname(os.path.abspath(__file__))
+DATOS = os.path.join(AQUI, "datos.json")
+SALIDA = os.path.join(AQUI, "renta_fija.html")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def a_float(txt):
+    if txt is None:
+        return None
+    s = re.sub(r"[^0-9.\-]", "", str(txt).replace(",", "").replace("%", ""))
+    try:
+        return float(s) if s not in ("", "-", ".") else None
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------- lectura de las fichas
+#
+# Cada emisor nombra los mismos conceptos distinto. En vez de un parser de HTML
+# por emisor, se aplana la pagina a texto plano y se busca cada concepto por sus
+# etiquetas posibles, en orden de preferencia.
+
+ETIQUETAS = {
+    # La ficha mexicana de iShares esta en espanol. Se dejan tambien las
+    # etiquetas inglesas por si el script termina leyendo una pagina en ingles.
+    "iShares (BlackRock)": {
+        "ytm":      ["Rendimiento promedio a vencimiento", "Rendimiento a vencimiento",
+                     "Weighted Average YTM"],
+        "vto_prom": ["Vencimiento promedio ponderado", "Vencimiento promedio",
+                     "Weighted Avg Maturity"],
+        "duracion": ["Duracion efectiva", "Duración efectiva", "Effective Duration"],
+        "ter":      ["Ratio de gastos totales", "Gastos corrientes",
+                     "Total Expense Ratio", "Ongoing Charge", "Comision", "Comisión"],
+    },
+    "Vanguard": {
+        "ytm":      ["Yield to maturity", "Yield to worst"],
+        "vto_prom": ["Average maturity", "Average effective maturity"],
+        "duracion": ["Average duration", "Effective duration"],
+        "ter":      ["Ongoing charge figure", "Ongoing charges figure", "OCF"],
+    },
+}
+LIMITES = {"ytm": (0, 25), "ter": (0, 3), "duracion": (-5, 40), "vto_prom": (0, 60)}
+RE_TAGS = re.compile(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", re.S | re.I)
+RE_FECHAS = [(re.compile(r"(?:as of|al) (\d{1,2}/[A-Za-z]{3}/\d{4})"), "%d/%b/%Y"),
+             (re.compile(r"(?:as of|al) (\d{1,2} [A-Za-z]{3} \d{4})"), "%d %b %Y"),
+             (re.compile(r"(?:as at|al) (\d{1,2}/\d{2}/\d{4})"), "%d/%m/%Y")]
+
+
+def a_texto(html):
+    t = RE_TAGS.sub(" ", html)
+    for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&#39;", "'"), ("&quot;", '"')):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t)
+
+
+def valor_tras(texto, etiqueta, ventana=90):
+    """Primer numero dentro de `ventana` caracteres despues de la etiqueta."""
+    for m in re.finditer(re.escape(etiqueta), texto, re.I):
+        cola = re.sub(r"as of\s+\S+", " ", texto[m.end():m.end() + ventana], flags=re.I)
+        n = re.search(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cola)
+        if n:
+            v = a_float(n.group(1))
+            if v is not None:
+                return v
+    return None
+
+
+def bajar_etf(sesion, etf):
+    campos = {}
+    try:
+        # el enlace visible apunta al sitio mexicano; las cifras pueden venir
+        # de otra pagina cuando la mexicana no las publica en HTML
+        r = sesion.get(etf.get("url_datos") or etf["url"], timeout=30)
+        if not r.ok:
+            return {}
+        texto = a_texto(r.text)
+    except Exception as e:
+        print("    ! red: %s" % e)
+        return {}
+
+    for campo, etiquetas in ETIQUETAS.get(etf["emisor"], {}).items():
+        for et in etiquetas:
+            v = valor_tras(texto, et)
+            if v is not None:
+                campos[campo] = v
+                break
+    for rx, fmt in RE_FECHAS:
+        m = rx.search(texto)
+        if m:
+            try:
+                campos["fecha"] = datetime.strptime(m.group(1), fmt).date().isoformat()
+                break
+            except ValueError:
+                pass
+    # descarta lecturas absurdas antes de que contaminen la base
+    for campo, (lo, hi) in LIMITES.items():
+        if campo in campos and not (lo <= campos[campo] <= hi):
+            campos.pop(campo)
+    return campos
+
+
+# ------------------------------------------------------ referencia mexicana
+
+SIE = "https://www.banxico.org.mx/SieAPIRest/service/v1/series/{ids}/datos/oportuno"
+
+
+def bajar_mexico(db):
+    mx = db["mexico"]
+    token = os.environ.get("BANXICO_TOKEN", "").strip()
+    if not token:
+        print("  Sin BANXICO_TOKEN: conservo las tasas guardadas (%s)." % mx["actualizado"])
+        print("  Token gratuito: https://www.banxico.org.mx/SieAPIRest/service/v1/token")
+        return
+    ids = ",".join(r["serie"] for r in mx["referencias"] if r.get("serie"))
+    try:
+        r = requests.get(SIE.format(ids=ids),
+                         headers={"Bmx-Token": token, "Accept": "application/json"},
+                         timeout=30)
+        r.raise_for_status()
+        datos = {s["idSerie"]: s.get("datos", []) for s in r.json()["bmx"]["series"]}
+    except Exception as e:
+        print("  Banxico no respondio (%s): conservo las guardadas." % e)
+        return
+    for refe in mx["referencias"]:
+        d = datos.get(refe.get("serie")) or []
+        v = a_float(d[0].get("dato")) if d else None
+        if v is None or not (0 < v < 40):
+            print("    ! %s sin dato usable, conservo %.2f" % (refe["nombre"], refe["tasa"]))
+            continue
+        refe["tasa"] = v
+        try:
+            refe["fecha"] = datetime.strptime(d[0]["fecha"], "%d/%m/%Y").date().isoformat()
+        except (ValueError, KeyError):
+            pass
+        print("    %-16s %.2f%%  (%s)" % (refe["nombre"], refe["tasa"], refe["fecha"]))
+    mx["actualizado"] = date.today().isoformat()
+    print("  La inflacion (%s%%) no viene del SIE: actualizala a mano en datos.json"
+          % mx["inflacion_anual"])
+
+
+TE = "https://tradingeconomics.com/%s/inflation-cpi"
+TE_PAIS = {"MXN": "mexico", "USD": "united-states", "EUR": "euro-area"}
+
+
+def bajar_inflacion(db, sesion):
+    """Refresca la inflacion anual desde tradingeconomics.com.
+
+    La pagina publica la frase 'Inflation Rate in X decreased to N percent in
+    <mes>'. Se lee ese numero. Si cambia el formato, conserva el guardado.
+    """
+    inf = db["mexico"].get("inflaciones") or {}
+    for divisa, pais in TE_PAIS.items():
+        if divisa not in inf:
+            continue
+        try:
+            r = sesion.get(TE % pais, timeout=30)
+            if not r.ok:
+                raise RuntimeError("HTTP %s" % r.status_code)
+            texto = a_texto(r.text)
+            m = re.search(r"Inflation Rate in [^.]{0,40}?"
+                          r"(?:increased|decreased|remained|was|rose|fell)[^.]{0,20}?"
+                          r"to ([\d.]+) ?percent", texto, re.I)
+            if not m:
+                m = re.search(r"Inflation Rate\s+([\d.]+)\s*%", texto)
+            v = a_float(m.group(1)) if m else None
+            if v is None or not (-5 < v < 60):
+                print("    ! %s sin dato usable, conservo %.2f%%" % (divisa, inf[divisa]["valor"]))
+                continue
+            inf[divisa]["valor"] = v
+            print("    inflacion %-4s %.2f%%" % (divisa, v))
+        except Exception as e:
+            print("    ! %s: %s -> conservo %.2f%%" % (divisa, e, inf[divisa]["valor"]))
+
+
+def plazo_de(vto):
+    """vto viene en anios; las etiquetas se muestran en meses."""
+    if vto < 1:
+        return "Ultra corto (<12m)"
+    if vto < 3:
+        return "Corto (12-36m)"
+    if vto < 7:
+        return "Medio (36-84m)"
+    return "Largo (84m+)"
+
+
+def actualizar(db, pausa=1.2):
+    sesion = requests.Session()
+    sesion.headers.update({"User-Agent": UA, "Accept-Language": "en-GB,en;q=0.9"})
+    ok = fallos = 0
+    for e in db["etfs"]:
+        print("  %-6s %-52s" % (e["ticker"], e["nombre"][:52]), end="  ")
+        nuevos = bajar_etf(sesion, e)
+        if nuevos.get("ytm") is not None:
+            e.update(nuevos)
+            e["neto"] = round(e["ytm"] - e["ter"], 4)
+            e["plazo"] = plazo_de(e["vto_prom"])
+            print("OK  tasa %.2f%%  costo %.2f%%  neto %.2f%%" % (e["ytm"], e["ter"], e["neto"]))
+            ok += 1
+        else:
+            print("SIN DATO -> conservo lo anterior (%s)" % e.get("fecha", "?"))
+            fallos += 1
+        time.sleep(pausa)
+    db["actualizado"] = date.today().isoformat()
+    print("\n  %d actualizados, %d conservados." % (ok, fallos))
+    return db, ok
+
+
+# ================================================================ dashboard
+
+PLANTILLA = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renta fija — comparador y armador de portafolio</title>
+<style>
+  :root{
+    color-scheme: light;
+    --plane:#f9f9f7; --surface:#fcfcfb;
+    --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
+    --s1:#2a78d6; --s2:#008300; --s3:#eda100; --s4:#e87ba4;
+    --good:#006300; --alerta:#b06a00; --mx:#4a3aa7;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:where(:not([data-theme="light"])){
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19;
+      --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
+      --s1:#3987e5; --s2:#008300; --s3:#c98500; --s4:#d55181;
+      --good:#0ca30c; --alerta:#fab219; --mx:#9085e9;
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --plane:#0d0d0d; --surface:#1a1a19;
+    --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
+    --s1:#3987e5; --s2:#008300; --s3:#c98500; --s4:#d55181;
+    --good:#0ca30c; --alerta:#fab219; --mx:#9085e9;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--plane);color:var(--ink);
+       font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px;line-height:1.45}
+  .wrap{max-width:1320px;margin:0 auto;padding:26px 18px 64px}
+  header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+  h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+  .sub{color:var(--ink2);font-size:13px;margin:0}
+  .btn{background:var(--surface);border:1px solid var(--ring);color:var(--ink2);
+       border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;font-family:inherit}
+  .btn:hover{color:var(--ink)}
+
+  .panel{background:var(--surface);border:1px solid var(--ring);border-radius:12px;
+         padding:18px 20px;margin:18px 0}
+  .panel h2{font-size:15px;margin:0 0 3px;letter-spacing:.01em}
+  .panel h2 .n{color:var(--muted);font-weight:400}
+  .panel .hint{color:var(--muted);font-size:12.5px;margin:0 0 15px;max-width:88ch}
+
+  .filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:14px}
+  .f{display:flex;flex-direction:column;gap:4px}
+  .f label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  select,input[type=number],input[type=search]{background:var(--plane);color:var(--ink);
+       border:1px solid var(--ring);border-radius:8px;padding:6px 9px;font-size:13px;font-family:inherit}
+  .filters select,.filters input{min-width:150px}
+
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th,td{padding:8px 9px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--grid)}
+  th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;
+     font-weight:600;cursor:pointer;user-select:none;border-bottom:1px solid var(--axis)}
+  th:hover{color:var(--ink)} th.act{color:var(--ink)}
+  tbody tr:hover{background:color-mix(in srgb,var(--ink) 4%,transparent)}
+  .izq{text-align:left}
+  a.tk{font-weight:600;color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--axis)}
+  a.tk:hover{border-bottom-color:var(--ink)}
+  .sub2{color:var(--muted);font-size:11px}
+  .big{font-weight:600}
+  .pos{color:var(--good)} .neg{color:var(--alerta)}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+  .pill{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;
+        border:1px solid var(--ring);color:var(--ink2)}
+  .asterisco{color:var(--muted);font-size:10px;vertical-align:super}
+  .scroll{overflow-x:auto}
+  /* las dos tablas son anchas: se deja respirar a las columnas de texto y se
+     aprieta el resto para que quepan sin scroll horizontal en pantalla normal */
+  th,td{padding:8px 7px}
+  #t1 td:nth-child(2){white-space:normal;max-width:300px;line-height:1.32}
+  #t3 td:nth-child(2){white-space:normal;max-width:250px;line-height:1.3}
+  #t3 td:nth-child(9),#t3 th:nth-child(9){white-space:normal;max-width:175px;line-height:1.3}
+  #t1 th:nth-child(11),#t1 td:nth-child(11){max-width:150px;white-space:normal;line-height:1.3}
+  .vacio{color:var(--muted);padding:24px 0;text-align:center}
+
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
+  .tile{background:var(--plane);border:1px solid var(--ring);border-radius:11px;padding:13px 15px}
+  .tile .lab{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .tile .val{font-size:25px;margin-top:3px;letter-spacing:-.02em}
+  .tile .note{color:var(--ink2);font-size:12px;margin-top:2px}
+
+  .cv{flex:1 1 118px;background:var(--plane);border:1px solid var(--ring);border-radius:10px;
+      padding:9px 11px;cursor:pointer}
+  .cv:hover{border-color:var(--axis)}
+  .cv.on{border-color:var(--mx);box-shadow:inset 0 0 0 1px var(--mx)}
+  .cv b{display:block;font-size:18px;font-weight:600}
+  .cv span{color:var(--muted);font-size:11px}
+  .curva{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+
+  .perfiles{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+  .perfil{background:var(--plane);border:1px solid var(--ring);color:var(--ink2);
+          border-radius:20px;padding:6px 15px;font-size:13px;cursor:pointer;font-family:inherit}
+  .perfil:hover{color:var(--ink);border-color:var(--axis)}
+  .perfil.on{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+  .cubo{padding:14px 0;border-bottom:1px solid var(--grid)}
+  .cubo:last-of-type{border-bottom:0}
+  .cubo-top{display:grid;grid-template-columns:250px 1fr 74px;gap:12px;align-items:center}
+  .cubo .nom{display:flex;align-items:center;gap:8px;font-size:13px}
+  .cubo .nom small{display:block;color:var(--muted);font-size:11px}
+  .opts{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:11px}
+  .opt{background:var(--plane);border:1px solid var(--ring);border-radius:10px;padding:8px 10px;
+       cursor:pointer;text-align:left;font-family:inherit;color:var(--ink);min-width:0}
+  .opt:hover{border-color:var(--axis)}
+  .opt.on{border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc);
+          background:color-mix(in srgb,var(--acc) 8%,var(--plane))}
+  .opt .tk2{font-weight:600;font-size:13px;display:flex;justify-content:space-between;gap:6px;align-items:baseline}
+  .opt .tk2 em{font-style:normal;font-size:11px;color:var(--muted)}
+  .opt .cifra{font-size:16px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
+  .opt .det{color:var(--muted);font-size:10.5px;margin-top:2px;line-height:1.35;
+            overflow:hidden;text-overflow:ellipsis}
+  .opt.vacio2{cursor:default;opacity:.45;border-style:dashed}
+  @media (max-width:900px){ .opts{grid-template-columns:repeat(2,1fr)} }
+  input[type=range]{-webkit-appearance:none;appearance:none;background:transparent;
+       width:100%;height:22px;cursor:pointer;margin:0}
+  input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:99px;background:var(--grid)}
+  input[type=range]::-moz-range-track{height:6px;border-radius:99px;background:var(--grid)}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+       width:16px;height:16px;border-radius:50%;background:var(--acc);
+       border:2px solid var(--surface);box-shadow:0 0 0 1px var(--ring);margin-top:-5px}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;
+       background:var(--acc);border:2px solid var(--surface);box-shadow:0 0 0 1px var(--ring)}
+  input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+  .pct{background:var(--plane);border:1px solid var(--ring);border-radius:8px;padding:5px 7px;
+       font-size:13px;text-align:right;width:100%;min-width:0;color:var(--ink);
+       font-family:inherit;font-variant-numeric:tabular-nums}
+  .cubo select{width:100%;min-width:0;font-size:12.5px}
+  .cubo .met{color:var(--muted);font-size:11px;margin-top:3px}
+  .barra{display:flex;height:30px;border-radius:8px;overflow:hidden;margin:18px 0 8px;
+         background:var(--plane);border:1px solid var(--ring)}
+  .barra div{display:flex;align-items:center;justify-content:center;font-size:11.5px;
+             font-weight:600;color:#fff;overflow:hidden;box-shadow:inset -2px 0 0 var(--surface)}
+  .barra div:last-child{box-shadow:none}
+  .leyenda{display:flex;gap:16px;flex-wrap:wrap;color:var(--ink2);font-size:12.5px;margin-bottom:6px}
+  .leyenda span{display:flex;align-items:center;gap:6px}
+  .aviso{background:color-mix(in srgb,var(--alerta) 10%,transparent);
+         border:1px solid color-mix(in srgb,var(--alerta) 35%,transparent);
+         border-radius:10px;padding:9px 12px;font-size:12.5px;color:var(--ink2);margin:12px 0 0}
+  .aviso b{color:var(--ink)}
+  svg#chart{display:block;width:100%;height:auto;overflow:visible}
+  .gl{stroke:var(--grid);stroke-width:1}
+  .ax{stroke:var(--axis);stroke-width:1}
+  .tick{fill:var(--muted);font-size:11px}
+  .axlab{fill:var(--ink2);font-size:12px}
+  .mxlab{fill:var(--mx);font-size:11.5px;font-weight:600}
+  .mk{stroke:var(--surface);stroke-width:2;cursor:pointer}
+  .mk:hover{stroke:var(--ink)}
+  .dl{fill:var(--ink2);font-size:11px;font-weight:600;pointer-events:none}
+  #tip{position:fixed;pointer-events:none;opacity:0;transition:opacity .1s;
+       background:var(--surface);border:1px solid var(--ring);border-radius:8px;
+       padding:9px 11px;font-size:12px;box-shadow:0 6px 20px rgba(0,0,0,.20);z-index:9;max-width:270px}
+  #tip b{display:block;margin-bottom:3px;font-size:12.5px}
+  #tip i{font-style:normal;color:var(--ink2)}
+  footer{color:var(--muted);font-size:12px;margin-top:26px;line-height:1.65;max-width:100ch}
+  footer strong{color:var(--ink2)}
+  @media (max-width:820px){ .cubo-top{grid-template-columns:1fr 74px;gap:8px} .cubo .nom{grid-column:1/-1} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>Renta fija — comparador y armador de portafolio</h1>
+    <p class="sub">__N__ ETFs UCITS acumulativos · datos oficiales de cada emisor · actualizado el __FECHA__</p>
+  </div>
+  <button class="btn" id="tema">Modo oscuro / claro</button>
+</header>
+
+<!-- ============ 1. LISTA DE ETFs ============ -->
+<div class="panel">
+  <h2>1. Lista de ETFs <span class="n">— __N__ instrumentos</span></h2>
+  <p class="hint">Cada ticker lleva a la ficha oficial del emisor. Haz clic en cualquier encabezado para reordenar.</p>
+  <div class="filters">
+    <div class="f"><label>Buscar</label><input type="search" id="q" placeholder="ticker o nombre"></div>
+    <div class="f"><label>Tipo</label><select id="f-tipo"></select></div>
+    <div class="f"><label>Subtipo</label><select id="f-sub"></select></div>
+    <div class="f"><label>Plazo</label><select id="f-plazo"></select></div>
+    <div class="f"><label>Divisa</label><select id="f-div"></select></div>
+    <div class="f"><label>Emisor</label><select id="f-emi"></select></div>
+    <button class="btn" id="limpiar">Limpiar</button>
+  </div>
+  <div class="scroll"><table id="t1"><thead><tr>
+    <th data-k="ticker" class="izq">Ticker</th>
+    <th data-k="nombre" class="izq">Nombre</th>
+    <th data-k="ytm">Tasa anual %</th>
+    <th data-k="vto_prom">Vto. (meses)</th>
+    <th data-k="vto_prom" class="izq">Plazo</th>
+    <th data-k="ter">Costo %</th>
+    <th data-k="neto" class="act">Tasa neta %</th>
+    <th data-k="divisa">Divisa</th>
+    <th data-k="tipo" class="izq">Tipo</th>
+    <th data-k="subtipo" class="izq">Subtipo</th>
+    <th data-k="calificacion" class="izq">Calificación</th>
+    <th data-k="fecha">Dato de</th>
+  </tr></thead><tbody id="b1"></tbody></table></div>
+  <div class="vacio" id="v1" style="display:none">Ningún ETF cumple los filtros.</div>
+  <p class="hint" style="margin:14px 0 0">
+    <span class="asterisco">m</span> = calificación derivada del mandato del índice, no un promedio ponderado publicado por el emisor.
+    iShares no publica el desglose crediticio en texto en su ficha; Vanguard sí publica una calificación promedio y ésa va sin marca.
+  </p>
+</div>
+
+<!-- ============ 2. ARMA TU PORTAFOLIO ============ -->
+<div class="panel">
+  <h2>2. Arma tu portafolio</h2>
+  <p class="hint">Elige un perfil y el plazo que quieres operar. Las cuatro barras siempre suman 100: si mueves una, el resto se reparte en proporción a como estaba.<br><b>Los ETFs de largo plazo (84 meses o más) quedan fuera de esta sección</b> — ni se recomiendan ni se pueden elegir. Con vencimientos tan largos el precio del fondo se mueve más por el vaivén de las tasas que por el cupón que cobras. Siguen visibles en la tabla de arriba y en la gráfica de abajo.<br>Cada familia muestra sus <b>4 mejores opciones por rendimiento neto</b>. Puedes marcar varias: el porcentaje de esa familia se reparte en partes iguales entre las que dejes marcadas.</p>
+  <div class="perfiles" id="perfiles"></div>
+  <div class="filters" style="margin:14px 0 4px">
+    <div class="f"><label>Plazo de los ETFs</label><select id="p-plazo"></select></div>
+    <div class="f"><label>Comparar contra</label><select id="p-ref"></select></div>
+  </div>
+  <div id="cubos"></div>
+  <div class="barra" id="barra"></div>
+  <div class="leyenda" id="leyenda"></div>
+  <div id="aviso-plazo"></div>
+  <div class="tiles" id="res" style="margin-top:18px"></div>
+</div>
+
+<!-- ============ 3. COMPARATIVA CONTRA CETES ============ -->
+<div class="panel">
+  <h2>3. Comparativa contra CETES</h2>
+  <p class="hint">Todo está en <b>rendimiento real y en pesos</b>: se convierte a MXN con la depreciación esperada del peso
+     y se le descuenta la inflación mexicana. Así se compara lo único que importa para ti — cuánto poder de compra ganas al año.
+     Las líneas punteadas moradas son la curva de CETES en esos mismos términos; la línea gris del 0% es el punto donde
+     apenas empatas con la inflación.</p>
+  <div class="filters" style="margin-bottom:10px">
+    <div class="f"><label>Depreciación esperada del peso vs USD (% anual)</label>
+      <input type="number" id="d-usd" step="0.1"></div>
+    <div class="f"><label>vs EUR (% anual)</label>
+      <input type="number" id="d-eur" step="0.1"></div>
+    <button class="btn" id="ppp">Volver a paridad de inflación</button>
+  </div>
+  <p class="hint" id="nota-infl" style="margin:0 0 12px"></p>
+  <div class="curva" id="curva"></div>
+  <div class="leyenda" id="leyenda-g"></div>
+  <svg id="chart" viewBox="0 0 960 470" role="img"
+       aria-label="Dispersión de rendimiento neto contra vencimiento promedio, con la curva de CETES como líneas de referencia. Los datos exactos están en la tabla de la sección 1."></svg>
+  <div class="tiles" id="res-g" style="margin-top:18px"></div>
+</div>
+
+<footer>
+  <strong>Cómo leer esto.</strong> La <em>tasa anual</em> es el rendimiento a vencimiento de la cartera del fondo (YTM): lo que rendiría si mantienes el ETF y los bonos llegan a su vencimiento, antes de costos. La <em>tasa neta</em> le resta el costo administrativo anual (TER). Todo está en la divisa del fondo, no en pesos.<br>
+  <strong>La comparación correcta (sección 3).</strong> Ahí todo se lleva a una sola base: <em>rendimiento real, en pesos</em>. A cada ETF se le aplica <em>(1 + tasa neta) × (1 + depreciación esperada del peso) / (1 + inflación mexicana) − 1</em>. La depreciación por defecto sale de la paridad de poder adquisitivo — el diferencial de inflación entre México y cada país — y es un <b>supuesto tuyo, no un dato de mercado</b>: los dos campos son editables y mueven toda la gráfica. Bajo ese supuesto el rendimiento real en pesos de un bono extranjero coincide con su rendimiento real en su propia divisa, que es justo lo que lo vuelve comparable con un CETE.<br>
+  <strong>Lo que no está aquí.</strong> No hay impuestos (el ISR de CETES y el de un ETF extranjero no se calculan igual), ni comisiones de tu broker, ni el spread de compraventa, ni el riesgo de impago. Una tasa alta en emergentes o high yield paga por probabilidad de que no te paguen: compara dentro de la misma familia.<br>
+  <strong>Fechas.</strong> iShares publica casi a diario; Vanguard por trimestre. La columna «Dato de» te dice de cuándo es cada cifra — no compares un dato de junio con uno de ayer si las tasas se movieron.<br>
+  Datos: fichas oficiales en sus sitios mexicanos — <a href="https://www.blackrock.com/mx/intermediarios" target="_blank" rel="noopener" style="color:inherit">blackrock.com/mx</a> y <a href="https://www.vanguardmexico.com" target="_blank" rel="noopener" style="color:inherit">vanguardmexico.com</a>. Inflación y macro: <a href="https://tradingeconomics.com" target="_blank" rel="noopener" style="color:inherit">tradingeconomics.com</a>. Tasas mexicanas: Banxico. Nota: la ficha mexicana de Vanguard no publica las métricas de cartera en la página (viven en el PDF), así que sus cifras se leen del sitio del emisor en el Reino Unido aunque el enlace te lleve al mexicano. Esto es información, no una recomendación de inversión.
+</footer>
+
+</div>
+<div id="tip"></div>
+<script>
+const DB = __DATOS__;
+const ETFS = DB.etfs;
+const MX = DB.mexico;
+
+const FAMILIAS = [
+  {k:"Gubernamental desarrollado",     c:"--s1"},
+  {k:"Corporativo grado de inversion", c:"--s2"},
+  {k:"Emergentes",                     c:"--s3"},
+  {k:"Corporativo high yield",         c:"--s4"},
+];
+const COLOR = Object.fromEntries(FAMILIAS.map(f=>[f.k,f.c]));
+const PLAZOS = ["Ultra corto (<12m)","Corto (12-36m)","Medio (36-84m)","Largo (84m+)"];
+// El armador deja fuera el largo plazo: con vencimientos de 84 meses en adelante
+// el precio del fondo se mueve mas por tasas que por el cupon que cobras, y eso
+// no es lo que se busca al armar una posicion de renta fija por rendimiento.
+const PLAZO_EXCLUIDO = "Largo (84m+)";
+const PLAZOS_PORTAFOLIO = PLAZOS.filter(p=>p!==PLAZO_EXCLUIDO);
+const PERFILES = {
+  "Conservador": [75, 25,  0,  0],
+  "Moderado":    [45, 30, 20,  5],
+  "Agresivo":    [20, 25, 35, 20],
+};
+
+const $ = id => document.getElementById(id);
+// "UCITS ETF" aparece en los 39 nombres: quitarlo de la vista gana media columna.
+const corto = n => n.replace(/\s*UCITS ETF\s*/," ").replace(/\s+/g," ").trim();
+const emisorCorto = e => e.replace(" (BlackRock)","");
+const plazoCorto = p => p.replace(/\s*\(.*\)/,"");
+const n2 = v => (v==null || isNaN(v)) ? "—" : v.toFixed(2);
+// El vencimiento promedio se guarda en anios y se muestra siempre en meses.
+const meses = v => (v==null || isNaN(v)) ? null : v*12;
+const n0 = v => (v==null || isNaN(v)) ? "—" : Math.round(v).toLocaleString("es-MX");
+let ref = MX.referencias.find(r=>r.clave==="cetes364") || MX.referencias[0];
+
+/* ---- rendimiento real, en pesos ----
+   Para alguien que gasta en pesos lo que cuenta es el poder de compra que gana
+   al año. Un bono en dolares pasa por dos ajustes antes de ser comparable:
+     1) se convierte a MXN con la depreciacion esperada del peso, d
+     2) se le descuenta la inflacion mexicana
+   real = (1 + neto) * (1 + d) / (1 + inflacion MXN) - 1
+   La d por defecto sale de la paridad de poder adquisitivo: si Mexico inflaciona
+   menos que EE.UU., la teoria dice que el peso deberia apreciarse, no perder.
+   Es un SUPUESTO, no un dato: por eso los dos campos son editables. */
+const INFL = MX.inflaciones;
+const pppDe = c => c==="MXN" ? 0 : ((1+INFL.MXN.valor/100)/(1+INFL[c].valor/100)-1)*100;
+let deprec = {MXN:0, USD:pppDe("USD"), EUR:pppDe("EUR")};
+function realMXN(neto, divisa){
+  const d = (deprec[divisa] || 0)/100;
+  return ((1+neto/100)*(1+d)/(1+INFL.MXN.valor/100) - 1)*100;
+}
+const refReal = () => realMXN(ref.tasa, "MXN");
+// Paridad de tasas: cuanto debe moverse el peso para que el ETF empate la referencia.
+const equilibrio = neto => (1 + ref.tasa/100) / (1 + neto/100) - 1;
+
+/* ---------------- 1. LISTA ---------------- */
+function opciones(sel, campo, orden){
+  let vals = [...new Set(ETFS.map(e=>e[campo]))];
+  vals = orden ? orden.filter(v=>vals.includes(v)) : vals.sort();
+  sel.innerHTML = '<option value="">Todos</option>' + vals.map(v=>`<option>${v}</option>`).join("");
+}
+opciones($("f-tipo"),"tipo"); opciones($("f-sub"),"subtipo");
+opciones($("f-plazo"),"plazo",PLAZOS); opciones($("f-div"),"divisa"); opciones($("f-emi"),"emisor");
+
+let orden = {k:"neto", desc:true};
+
+function filtrar(){
+  const q=$("q").value.trim().toLowerCase(), t=$("f-tipo").value, s=$("f-sub").value,
+        p=$("f-plazo").value, d=$("f-div").value, em=$("f-emi").value;
+  return ETFS.filter(e=>
+    (!q || e.ticker.toLowerCase().includes(q) || e.nombre.toLowerCase().includes(q)) &&
+    (!t||e.tipo===t) && (!s||e.subtipo===s) && (!p||e.plazo===p) &&
+    (!d||e.divisa===d) && (!em||e.emisor===em));
+}
+function ordenar(arr){
+  const k=orden.k, s=orden.desc?-1:1;
+  return arr.slice().sort((a,b)=>{
+    let x=a[k], y=b[k];
+    if(x==null) return 1; if(y==null) return -1;
+    return typeof x==="string" ? s*x.localeCompare(y) : s*(x-y);
+  });
+}
+function tabla1(){
+  const f = ordenar(filtrar());
+  $("v1").style.display = f.length ? "none" : "block";
+  $("b1").innerHTML = f.map(e=>`<tr>
+    <td class="izq"><span class="dot" style="background:var(${COLOR[e.familia]})"></span>
+        <a class="tk" href="${e.url}" target="_blank" rel="noopener">${e.ticker}</a></td>
+    <td class="izq" title="${e.nombre}">${corto(e.nombre)}<div class="sub2">${e.isin} · ${emisorCorto(e.emisor)}</div></td>
+    <td>${n2(e.ytm)}</td>
+    <td>${n0(meses(e.vto_prom))}</td>
+    <td class="izq"><span class="pill" title="${e.plazo}">${plazoCorto(e.plazo)}</span></td>
+    <td>${n2(e.ter)}</td>
+    <td class="big pos">${n2(e.neto)}</td>
+    <td>${e.divisa}</td>
+    <td class="izq">${e.tipo}</td>
+    <td class="izq">${e.subtipo}</td>
+    <td class="izq">${e.calificacion}${e.calif_fuente==="mandato"?'<span class="asterisco">m</span>':""}</td>
+    <td>${e.fecha}</td></tr>`).join("");
+  document.querySelectorAll("#t1 th[data-k]").forEach(th=>
+    th.classList.toggle("act", th.dataset.k===orden.k));
+}
+document.querySelectorAll("#t1 th[data-k]").forEach(th=>th.addEventListener("click",()=>{
+  const k=th.dataset.k;
+  orden = (orden.k===k) ? {k, desc:!orden.desc} : {k, desc:true};
+  tabla1();
+}));
+["q","f-tipo","f-sub","f-plazo","f-div","f-emi"].forEach(id=>$(id).addEventListener("input",tabla1));
+$("limpiar").addEventListener("click",()=>{
+  ["f-tipo","f-sub","f-plazo","f-div","f-emi"].forEach(id=>$(id).value="");
+  $("q").value=""; orden={k:"neto",desc:true}; tabla1();
+});
+
+/* ---------------- 2. PORTAFOLIO ---------------- */
+$("p-plazo").innerHTML = '<option value="">Todos menos largo plazo</option>' +
+  PLAZOS_PORTAFOLIO.map(p=>`<option>${p}</option>`).join("");
+$("p-ref").innerHTML = MX.referencias.map(r=>
+  `<option value="${r.clave}" ${r.clave===ref.clave?"selected":""}>${r.nombre} — ${n2(r.tasa)}%</option>`).join("");
+$("perfiles").innerHTML = Object.keys(PERFILES).map(k=>
+  `<button class="perfil" data-p="${k}">${k}</button>`).join("");
+
+let pesos = PERFILES["Moderado"].slice();
+// Cada familia muestra sus 4 mejores candidatos y puedes tener varios a la vez:
+// el peso de la familia se reparte en partes iguales entre los seleccionados.
+const OPCIONES_POR_FAMILIA = 4;
+let elegidos = [[],[],[],[]];
+
+function candidatos(i){
+  const p = $("p-plazo").value;
+  return ETFS.filter(e=>e.familia===FAMILIAS[i].k
+                     && e.plazo!==PLAZO_EXCLUIDO        // el largo plazo nunca entra
+                     && (!p || e.plazo===p))
+             .sort((a,b)=>b.neto-a.neto);
+}
+function topCandidatos(i){ return candidatos(i).slice(0, OPCIONES_POR_FAMILIA); }
+
+function sincronizarElegidos(){
+  FAMILIAS.forEach((f,i)=>{
+    const top = topCandidatos(i).map(e=>e.isin);
+    // se conservan los que sigan estando entre las opciones visibles
+    elegidos[i] = (elegidos[i] || []).filter(x=>top.includes(x));
+    if(!elegidos[i].length && top.length) elegidos[i] = [top[0]];
+  });
+}
+const porISIN = isin => ETFS.find(e=>e.isin===isin) || null;
+const elegidosDe = i => (elegidos[i]||[]).map(porISIN).filter(Boolean);
+
+function alternar(i, isin){
+  const sel = elegidos[i] || [];
+  if(sel.includes(isin)){
+    if(sel.length===1) return;            // siempre queda al menos uno marcado
+    elegidos[i] = sel.filter(x=>x!==isin);
+  } else {
+    elegidos[i] = sel.concat([isin]);
+  }
+  pintarPortafolio();
+}
+
+// Mueve un cubo a v y reparte el resto entre los otros tres en proporcion a como
+// estaban. Si estaban todos en cero, en partes iguales. El redondeo a enteros
+// deja el sobrante en el mayor de los otros: la suma nunca se va de 100.
+function ajustar(i, v){
+  v = Math.max(0, Math.min(100, Math.round(v)));
+  const suma = pesos.reduce((a,b,j)=>j===i?a:a+b, 0), resto = 100-v;
+  const crudos = pesos.map((p,j)=> j===i ? v : (suma>0 ? resto*p/suma : resto/3));
+  const red = crudos.map(Math.round);
+  let drift = 100 - red.reduce((a,b)=>a+b,0);
+  if(drift!==0){
+    let idx=-1, mejor=-1;
+    red.forEach((p,j)=>{ if(j!==i && p>mejor && p+drift>=0){ mejor=p; idx=j; } });
+    red[idx>=0?idx:i] += drift;
+  }
+  pesos = red;
+  pintarPortafolio();
+}
+
+function cubos(){
+  $("cubos").innerHTML = FAMILIAS.map((f,i)=>{
+    const total = candidatos(i).length, top = topCandidatos(i), sel = elegidos[i]||[];
+    const tarjetas = top.map(e=>{
+      const r = realMXN(e.neto, e.divisa);
+      return `<button class="opt ${sel.includes(e.isin)?"on":""}" data-i="${i}" data-isin="${e.isin}"
+               style="--acc:var(${f.c})" aria-pressed="${sel.includes(e.isin)}"
+               title="${e.nombre}">
+        <div class="tk2">${e.ticker}<em>${e.divisa}</em></div>
+        <div class="cifra">${n2(e.neto)}%</div>
+        <div class="det">${n2(r)}% real · ${n0(meses(e.vto_prom))}m<br>${emisorCorto(e.emisor)} · ${e.calificacion}</div>
+      </button>`;
+    }).join("");
+    const huecos = Array.from({length: Math.max(0, OPCIONES_POR_FAMILIA-top.length)},
+      ()=>`<div class="opt vacio2"><div class="det">sin más opciones<br>de este plazo</div></div>`).join("");
+    return `<div class="cubo">
+      <div class="cubo-top">
+        <div class="nom"><span class="dot" style="background:var(${f.c})"></span>
+          <span>${f.k}<small>${total ? `${sel.length} de ${Math.min(OPCIONES_POR_FAMILIA,total)} marcados · ${total} disponibles`
+                                     : "sin ETF de este plazo"}</small></span></div>
+        <div><input type="range" min="0" max="100" step="1" value="${pesos[i]}" data-i="${i}"
+              class="sl" style="--acc:var(${f.c})" aria-label="Porcentaje de ${f.k}"></div>
+        <div><input type="number" min="0" max="100" step="1" value="${pesos[i]}" data-i="${i}"
+              class="pct num" aria-label="Porcentaje de ${f.k}"></div>
+      </div>
+      ${ total ? `<div class="opts">${tarjetas}${huecos}</div>`
+               : `<div class="met" style="margin-top:8px">Ningún ETF de esta familia cae en el plazo elegido.</div>` }
+    </div>`;
+  }).join("");
+  $("cubos").querySelectorAll(".sl").forEach(el=>
+    el.addEventListener("input", ev=>ajustar(+ev.target.dataset.i, +ev.target.value)));
+  $("cubos").querySelectorAll(".num").forEach(el=>
+    el.addEventListener("change", ev=>ajustar(+ev.target.dataset.i, +ev.target.value)));
+  $("cubos").querySelectorAll(".opt[data-isin]").forEach(el=>
+    el.addEventListener("click", ()=>alternar(+el.dataset.i, el.dataset.isin)));
+}
+
+function pintarPortafolio(){
+  sincronizarElegidos();
+  cubos();
+  $("barra").innerHTML = FAMILIAS.map((f,i)=> pesos[i]>0
+    ? `<div style="width:${pesos[i]}%;background:var(${f.c})" title="${f.k}: ${pesos[i]}%">${pesos[i]>=7?pesos[i]+"%":""}</div>` : "").join("");
+  $("leyenda").innerHTML = FAMILIAS.map((f,i)=>
+    `<span><span class="dot" style="background:var(${f.c})"></span>${f.k} <b>${pesos[i]}%</b></span>`).join("");
+
+  let neto=0, ytm=0, ter=0, vto=0, dur=0, invertido=0;
+  const divisas={}, huecos=[];
+  FAMILIAS.forEach((f,i)=>{
+    const sel = elegidosDe(i);
+    if(pesos[i]===0) return;
+    if(!sel.length){ huecos.push(`${f.k} (${pesos[i]}%)`); return; }
+    // el peso de la familia se parte en partes iguales entre los ETFs marcados
+    const wCadaUno = pesos[i]/sel.length;
+    sel.forEach(e=>{
+      const w = wCadaUno/100;
+      neto+=w*e.neto; ytm+=w*e.ytm; ter+=w*e.ter; vto+=w*e.vto_prom; dur+=w*e.duracion;
+      divisas[e.divisa]=(divisas[e.divisa]||0)+wCadaUno;
+    });
+    invertido+=pesos[i];
+  });
+  // Si una familia quedo sin ETF, las metricas se reescalan a la parte invertida
+  // en vez de fingir que ese dinero rinde cero.
+  const esc = invertido>0 ? 100/invertido : 0;
+  neto*=esc; ytm*=esc; ter*=esc; vto*=esc; dur*=esc;
+
+  $("aviso-plazo").innerHTML = huecos.length
+    ? `<div class="aviso"><b>${invertido}% del portafolio está colocado.</b>
+       No hay ETF del plazo elegido para: ${huecos.join(", ")}. Las cifras de abajo son de la parte
+       que sí se pudo colocar — cambia el plazo o baja esas barras a 0.</div>` : "";
+
+  const mixDiv = Object.entries(divisas).sort((a,b)=>b[1]-a[1])
+                  .map(([d,p])=>`${d} ${Math.round(p*esc)}%`).join(" · ") || "—";
+  // el portafolio se lleva a la misma base real en pesos que la seccion 3;
+  // cada familia aporta su divisa, asi que el real se pondera fondo por fondo
+  let realPort = 0;
+  FAMILIAS.forEach((f,i)=>{
+    const sel = elegidosDe(i);
+    if(!sel.length || pesos[i]===0) return;
+    const wCadaUno = pesos[i]/sel.length/100;
+    sel.forEach(e=>{ realPort += wCadaUno * realMXN(e.neto, e.divisa); });
+  });
+  realPort *= esc;
+  const brechaReal = realPort - refReal();
+  $("res").innerHTML = invertido===0 ? `<div class="tile"><div class="lab">Sin portafolio</div>
+      <div class="val">—</div><div class="note">ninguna familia tiene ETF del plazo elegido</div></div>` : `
+    <div class="tile"><div class="lab">Tasa neta del portafolio</div><div class="val pos">${n2(neto)}%</div>
+      <div class="note">${n2(ytm)}% de tasa menos ${n2(ter)}% de costo</div></div>
+    <div class="tile"><div class="lab">Rendimiento real en pesos</div>
+      <div class="val ${realPort>=0?"pos":"neg"}">${n2(realPort)}%</div>
+      <div class="note">ya convertido a MXN y descontada la inflación</div></div>
+    <div class="tile"><div class="lab">Contra ${ref.nombre} en real</div>
+      <div class="val ${brechaReal>=0?"pos":"neg"}">${brechaReal>=0?"+":""}${n2(brechaReal)} pp</div>
+      <div class="note">${n2(realPort)}% contra ${n2(refReal())}% real</div></div>
+    <div class="tile"><div class="lab">Vencimiento promedio</div><div class="val">${n0(meses(vto))}</div>
+      <div class="note">meses (${n2(vto)} años) · duración ${n2(dur)}</div></div>
+    <div class="tile"><div class="lab">Costo administrativo</div><div class="val">${n2(ter)}%</div>
+      <div class="note">${n2(ter*10)} por cada 1,000 al año</div></div>
+    <div class="tile"><div class="lab">Divisas</div><div class="val" style="font-size:18px">${mixDiv}</div>
+      <div class="note">${elegidos.reduce((a,b,i)=>a+(pesos[i]>0?b.length:0),0)} ETFs en el portafolio</div></div>`;
+
+  $("perfiles").querySelectorAll(".perfil").forEach(b=>
+    b.classList.toggle("on", PERFILES[b.dataset.p].every((v,i)=>v===pesos[i])));
+}
+$("perfiles").querySelectorAll(".perfil").forEach(b=>b.addEventListener("click",()=>{
+  pesos = PERFILES[b.dataset.p].slice(); pintarPortafolio();
+}));
+$("p-plazo").addEventListener("change",()=>{ elegidos=[null,null,null,null]; pintarPortafolio(); });
+$("p-ref").addEventListener("change",()=>{
+  ref = MX.referencias.find(r=>r.clave===$("p-ref").value); todo();
+});
+
+/* ---------------- 3. GRAFICA COMPARATIVA ---------------- */
+function notaInflacion(){
+  $("d-usd").value = deprec.USD.toFixed(2);
+  $("d-eur").value = deprec.EUR.toFixed(2);
+  const l = c=>`<a href="${INFL[c].url}" target="_blank" rel="noopener" style="color:inherit">${c} ${n2(INFL[c].valor)}%</a>`;
+  $("nota-infl").innerHTML =
+    `Inflación anual (fuente: Trading Economics, julio 2026): <b>${l("MXN")}</b> · ${l("USD")} · ${l("EUR")}.
+     Por paridad de poder adquisitivo el peso se movería ${n2(pppDe("USD"))}% contra el dólar y ${n2(pppDe("EUR"))}% contra el euro:
+     como México inflaciona menos que Estados Unidos, la teoría dice que el peso debería <b>apreciarse</b>, no perder.
+     Es un supuesto, no un dato — cámbialo arriba si tienes otra expectativa.`;
+}
+$("d-usd").addEventListener("input",()=>{
+  const v=parseFloat($("d-usd").value); if(!isNaN(v)){ deprec.USD=v; grafica(); pintarPortafolio(); }});
+$("d-eur").addEventListener("input",()=>{
+  const v=parseFloat($("d-eur").value); if(!isNaN(v)){ deprec.EUR=v; grafica(); pintarPortafolio(); }});
+$("ppp").addEventListener("click",()=>{
+  deprec.USD=pppDe("USD"); deprec.EUR=pppDe("EUR"); todo();
+});
+
+function curva(){
+  $("curva").innerHTML = MX.referencias.map(r=>`
+    <div class="cv ${r.clave===ref.clave?"on":""}" data-c="${r.clave}">
+      <b>${n2(realMXN(r.tasa,"MXN"))}%</b><span>${r.nombre} real<br>nominal ${n2(r.tasa)}%</span></div>`).join("") +
+    `<div class="cv" style="cursor:default;border-style:dashed">
+       <b>${n2(INFL.MXN.valor)}%</b><span>Inflación MXN<br>ya descontada arriba</span></div>`;
+  $("curva").querySelectorAll(".cv[data-c]").forEach(el=>el.addEventListener("click",()=>{
+    ref = MX.referencias.find(r=>r.clave===el.dataset.c);
+    $("p-ref").value = ref.clave; todo();
+  }));
+}
+
+// Cuatro formas inconfundibles. Con cuatro series el color solo no basta para
+// daltonismo: la forma carga la identidad y el color refuerza.
+const FORMA = {"Gubernamental desarrollado":"circulo","Corporativo grado de inversion":"rombo",
+               "Emergentes":"cuadrado","Corporativo high yield":"triangulo"};
+function marca(forma, cx, cy, c){
+  const x=cx.toFixed(1), y=cy.toFixed(1);
+  if(forma==="circulo")  return `<circle class="mk" cx="${x}" cy="${y}" r="6" fill="${c}"/>`;
+  if(forma==="cuadrado") return `<rect class="mk" x="${(cx-5.4).toFixed(1)}" y="${(cy-5.4).toFixed(1)}" width="10.8" height="10.8" rx="2" fill="${c}"/>`;
+  if(forma==="rombo")    return `<rect class="mk" x="${(cx-5.4).toFixed(1)}" y="${(cy-5.4).toFixed(1)}" width="10.8" height="10.8" rx="2" fill="${c}" transform="rotate(45 ${x} ${y})"/>`;
+  return `<polygon class="mk" points="${x},${(cy-7).toFixed(1)} ${(cx+6.5).toFixed(1)},${(cy+4.5).toFixed(1)} ${(cx-6.5).toFixed(1)},${(cy+4.5).toFixed(1)}" fill="${c}"/>`;
+}
+
+function grafica(){
+  $("leyenda-g").innerHTML = FAMILIAS.map(f=>
+    `<span><span class="dot" style="background:var(${f.c})"></span>${f.k}
+     <i style="color:var(--muted);font-style:normal">${FORMA[f.k]}</i></span>`).join("") +
+    `<span><span style="display:inline-block;width:18px;border-top:2px dashed var(--mx);vertical-align:3px"></span>
+     &nbsp;curva de CETES</span>`;
+
+  const svg=$("chart"), W=960,H=470, m={t:18,r:26,b:56,l:64};
+  const iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const cetes = MX.referencias.filter(r=>r.clave.startsWith("cetes"));
+  // se dibuja la curva de CETES siempre; el Bono M solo si es la referencia
+  // elegida, porque su 9.14% estira la escala y aplasta la nube de ETFs
+  const lineas = ref.clave.startsWith("cetes") ? cetes : cetes.concat([ref]);
+  const tasasRef = lineas.map(r=>realMXN(r.tasa,"MXN"));
+
+  const xs = ETFS.map(e=>meses(e.vto_prom)), ys = ETFS.map(e=>realMXN(e.neto, e.divisa));
+  const x0=0, x1=Math.max(...xs)*1.06+4;
+  const y0=Math.min(...ys, ...tasasRef, 0)-0.4, y1=Math.max(...ys, ...tasasRef, 0)+0.4;
+  const X=v=>m.l+(v-x0)/(x1-x0)*iw, Y=v=>m.t+ih-(v-y0)/(y1-y0)*ih;
+  const ticks=(a,b,n)=>Array.from({length:n+1},(_,i)=>a+i*(b-a)/n);
+
+  let g="";
+  ticks(y0,y1,6).forEach(v=>{
+    g+=`<line class="gl" x1="${m.l}" x2="${W-m.r}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>
+        <text class="tick" x="${m.l-9}" y="${(Y(v)+4).toFixed(1)}" text-anchor="end">${v.toFixed(1)}%</text>`;
+  });
+  ticks(x0,x1,8).forEach(v=>{
+    g+=`<text class="tick" x="${X(v).toFixed(1)}" y="${m.t+ih+20}" text-anchor="middle">${Math.round(v)}</text>`;
+  });
+  g+=`<line class="ax" x1="${m.l}" x2="${W-m.r}" y1="${m.t+ih}" y2="${m.t+ih}"/>`;
+  g+=`<text class="axlab" x="${m.l+iw/2}" y="${H-14}" text-anchor="middle">Vencimiento promedio (meses)</text>`;
+  g+=`<text class="axlab" transform="rotate(-90 16 ${m.t+ih/2})" x="16" y="${m.t+ih/2}" text-anchor="middle">Rendimiento real en pesos (% anual)</text>`;
+  // la linea del 0% es el umbral de conservar poder de compra
+  g+=`<line x1="${m.l}" x2="${W-m.r}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}" stroke="var(--axis)" stroke-width="1.5"/>`;
+  g+=`<text class="tick" x="${W-m.r}" y="${(Y(0)+15).toFixed(1)}" text-anchor="end">0% = empatas con la inflación</text>`;
+
+  // banda de CETES: las cuatro tasas caben en menos de un punto porcentual, asi
+  // que etiquetarlas una por una las encimaria. Se sombrea el rango y se rotula
+  // una sola vez; la elegida va mas gruesa y con su propia etiqueta.
+  const cMin=Math.min(...cetes.map(r=>realMXN(r.tasa,"MXN"))), cMax=Math.max(...cetes.map(r=>realMXN(r.tasa,"MXN")));
+  g+=`<rect x="${m.l}" y="${Y(cMax).toFixed(1)}" width="${iw}" height="${(Y(cMin)-Y(cMax)).toFixed(1)}"
+        fill="var(--mx)" opacity="0.09"/>`;
+  lineas.forEach(r=>{
+    const y=Y(realMXN(r.tasa,"MXN")), sel = r.clave===ref.clave;
+    g+=`<line x1="${m.l}" x2="${W-m.r}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}"
+         stroke="var(--mx)" stroke-width="${sel?2.5:1.4}" stroke-dasharray="${sel?"7 4":"4 4"}"
+         opacity="${sel?1:.65}"/>`;
+  });
+  g+=`<text class="mxlab" x="${W-m.r}" y="${(Y(cMax)-8).toFixed(1)}" text-anchor="end">CETES en real: ${n2(cMin)}% – ${n2(cMax)}%</text>`;
+  g+=`<text class="mxlab" x="${m.l+6}" y="${(Y(refReal())-7).toFixed(1)}">${ref.nombre} ${n2(refReal())}% real</text>`;
+
+  ETFS.forEach((e,i)=>{
+    g+=`<g data-i="${i}">${marca(FORMA[e.familia], X(meses(e.vto_prom)), Y(realMXN(e.neto,e.divisa)), `var(${COLOR[e.familia]})`)}</g>`;
+  });
+
+  // etiqueta directa a los cuatro de mayor rendimiento neto, sin encimarse
+  const cajas=[];
+  ETFS.slice().sort((a,b)=>realMXN(b.neto,b.divisa)-realMXN(a.neto,a.divisa)).slice(0,4).forEach(e=>{
+    const bx=X(meses(e.vto_prom))+10, by=Y(realMXN(e.neto,e.divisa))-8;
+    const caja={x1:bx-2,y1:by-11,x2:bx+e.ticker.length*7.4+2,y2:by+3};
+    if(cajas.some(c=>!(caja.x2<c.x1||caja.x1>c.x2||caja.y2<c.y1||caja.y1>c.y2))) return;
+    cajas.push(caja);
+    g+=`<text class="dl" x="${bx.toFixed(1)}" y="${by.toFixed(1)}">${e.ticker}</text>`;
+  });
+  svg.innerHTML=g;
+
+  const tip=$("tip");
+  svg.querySelectorAll("g[data-i]").forEach(node=>{
+    const e=ETFS[+node.dataset.i];
+    node.addEventListener("mousemove",ev=>{
+      const r=realMXN(e.neto,e.divisa), brecha=r-refReal(), d=deprec[e.divisa]||0;
+      tip.innerHTML=`<b>${e.ticker} — ${corto(e.nombre)}</b>
+        <i>${e.familia} · ${e.divisa} · ${e.calificacion}</i><br>
+        Neto en ${e.divisa}: <b style="display:inline">${n2(e.neto)}%</b><br>
+        ${e.divisa==="MXN" ? "" : `Peso ${d>=0?"pierde":"gana"} ${n2(Math.abs(d))}% &rarr; ${n2(((1+e.neto/100)*(1+d/100)-1)*100)}% en MXN<br>`}
+        Menos inflación ${n2(INFL.MXN.valor)}% &rarr;
+        <b style="display:inline;color:${r>=0?"var(--good)":"var(--alerta)"}">${n2(r)}% real</b><br>
+        Contra ${ref.nombre} (${n2(refReal())}% real):
+        <b style="display:inline;color:${brecha>=0?"var(--good)":"var(--alerta)"}">${brecha>=0?"+":""}${n2(brecha)} pp</b><br>
+        Vencimiento ${n0(meses(e.vto_prom))} meses<br><i>dato de ${e.fecha}</i>`;
+      tip.style.opacity=1;
+      tip.style.left=Math.min(ev.clientX+14, innerWidth-284)+"px";
+      tip.style.top=Math.min(ev.clientY+14, innerHeight-150)+"px";
+    });
+    node.addEventListener("mouseleave",()=>tip.style.opacity=0);
+  });
+
+  // resumen debajo de la grafica, todo en terminos reales y en pesos
+  const rr = refReal();
+  const ganan = ETFS.filter(e=>realMXN(e.neto,e.divisa) >= rr);
+  const positivos = ETFS.filter(e=>realMXN(e.neto,e.divisa) > 0);
+  const mejor = ETFS.reduce((a,b)=>realMXN(b.neto,b.divisa)>realMXN(a.neto,a.divisa)?b:a);
+  const rMejor = realMXN(mejor.neto, mejor.divisa);
+  $("res-g").innerHTML=`
+    <div class="tile"><div class="lab">Le ganan a ${ref.nombre} en real</div>
+      <div class="val ${ganan.length?"pos":"neg"}">${ganan.length} de ${ETFS.length}</div>
+      <div class="note">referencia: ${n2(rr)}% real en pesos</div></div>
+    <div class="tile"><div class="lab">Ganan poder de compra</div>
+      <div class="val ${positivos.length?"pos":"neg"}">${positivos.length} de ${ETFS.length}</div>
+      <div class="note">rendimiento real arriba de 0%</div></div>
+    <div class="tile"><div class="lab">El mejor de la lista</div>
+      <div class="val ${rMejor>=0?"pos":"neg"}">${n2(rMejor)}%</div>
+      <div class="note">${mejor.ticker} · ${mejor.familia}</div></div>
+    <div class="tile"><div class="lab">Cuánto le falta al mejor</div>
+      <div class="val" style="color:var(--mx)">${(rr-rMejor)<=0?"nada":n2(rr-rMejor)+" pp"}</div>
+      <div class="note">${(rr-rMejor)<=0?"ya le gana a la referencia":"para alcanzar "+ref.nombre}</div></div>`;
+}
+
+/* ---------------- arranque ---------------- */
+function todo(){ notaInflacion(); tabla1(); pintarPortafolio(); curva(); grafica(); }
+$("tema").addEventListener("click",()=>{
+  const oscuro = document.documentElement.dataset.theme==="dark" ||
+    (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = oscuro ? "light" : "dark";
+  todo();
+});
+todo();
+</script>
+</body>
+</html>
+"""
+
+
+def generar_html(db):
+    html = (PLANTILLA
+            .replace("__DATOS__", json.dumps(db, ensure_ascii=False))
+            .replace("__FECHA__", db.get("actualizado", "—"))
+            .replace("__N__", str(len(db["etfs"]))))
+    with open(SALIDA, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("  Dashboard escrito en %s" % SALIDA)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Comparador de ETFs de renta fija")
+    ap.add_argument("--solo-html", action="store_true", help="regenera el HTML sin descargar")
+    ap.add_argument("--pausa", type=float, default=1.2, help="segundos entre peticiones")
+    ap.add_argument("--minimo-ok", type=int, default=0, metavar="N",
+                    help="sale con error si se actualizaron menos de N ETFs. "
+                         "En una tarea automatica ponlo (ej. 30) para enterarte "
+                         "si un emisor cambio su pagina y el raspador dejo de leer.")
+    args = ap.parse_args()
+
+    with open(DATOS, encoding="utf-8") as f:
+        db = json.load(f)
+
+    if not args.solo_html:
+        print("Referencia mexicana (Banxico):")
+        bajar_mexico(db)
+        print("\nActualizando %d ETFs desde las fichas de los emisores...\n" % len(db["etfs"]))
+        db, ok = actualizar(db, pausa=args.pausa)
+        with open(DATOS, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=1)
+        print("  Base de datos guardada en %s" % DATOS)
+        if args.minimo_ok and ok < args.minimo_ok:
+            generar_html(db)
+            sys.exit("\nERROR: solo %d de %d ETFs se actualizaron (minimo exigido: %d).\n"
+                     "Probablemente un emisor cambio el formato de su ficha. El HTML se\n"
+                     "regenero con los ultimos valores buenos, pero revisa el raspador."
+                     % (ok, len(db["etfs"]), args.minimo_ok))
+
+    generar_html(db)
+    print("\nListo. Abre renta_fija.html en tu navegador.")
+
+
+if __name__ == "__main__":
+    main()
