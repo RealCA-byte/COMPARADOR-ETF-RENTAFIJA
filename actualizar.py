@@ -74,9 +74,26 @@ ETIQUETAS = {
 }
 LIMITES = {"ytm": (0, 25), "ter": (0, 3), "duracion": (-5, 40), "vto_prom": (0, 60)}
 RE_TAGS = re.compile(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", re.S | re.I)
-RE_FECHAS = [(re.compile(r"(?:as of|al) (\d{1,2}/[A-Za-z]{3}/\d{4})"), "%d/%b/%Y"),
-             (re.compile(r"(?:as of|al) (\d{1,2} [A-Za-z]{3} \d{4})"), "%d %b %Y"),
-             (re.compile(r"(?:as at|al) (\d{1,2}/\d{2}/\d{4})"), "%d/%m/%Y")]
+MESES_ES = {"ene": "Jan", "feb": "Feb", "mar": "Mar", "abr": "Apr",
+            "may": "May", "jun": "Jun", "jul": "Jul", "ago": "Aug",
+            "sep": "Sep", "set": "Sep", "oct": "Oct", "nov": "Nov", "dic": "Dec"}
+
+RE_FECHAS = [(re.compile(r"(?:as of|as at|al?)\s+(\d{1,2}/[A-Za-z]{3}/\d{4})"), "%d/%b/%Y"),
+             (re.compile(r"(?:as of|as at|al?)\s+(\d{1,2} [A-Za-z]{3} \d{4})"), "%d %b %Y"),
+             # formato de la ficha mexicana: "a 18-ago-2026"
+             (re.compile(r"(?:as of|as at|al?)\s+(\d{1,2}-[A-Za-z]{3}\w*-\d{4})"), "%d-%b-%Y"),
+             (re.compile(r"(?:as at|al)\s+(\d{1,2}/\d{2}/\d{4})"), "%d/%m/%Y")]
+
+
+def a_fecha(txt, fmt):
+    """Convierte a ISO, traduciendo el mes al ingles si viene en espanol."""
+    t = txt.strip()
+    for es, en in MESES_ES.items():
+        t = re.sub(es + r"\w*", en, t, flags=re.I)
+    try:
+        return datetime.strptime(t, fmt).date().isoformat()
+    except ValueError:
+        return None
 
 
 def a_texto(html):
@@ -86,12 +103,28 @@ def a_texto(html):
     return re.sub(r"\s+", " ", t)
 
 
+# Entre la etiqueta y el valor, las fichas meten la fecha del dato: en ingles
+# "as of 18/Aug/2026" y en la mexicana "a 18-ago-2026". Si no se borra primero,
+# el raspador lee el DIA como si fuera la cifra. Asi fue como los 27 fondos de
+# iShares terminaron los tres con 18.00 un 18 de agosto.
+RE_FECHA_PEGADA = re.compile(
+    r"(?:as of|as at|al?)?\s*\d{1,2}\s*[-/]\s*"
+    r"(?:\d{1,2}|ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic"
+    r"|jan|apr|aug|dec)\w*\s*[-/]\s*\d{2,4}", re.I)
+
+
 def valor_tras(texto, etiqueta, ventana=90):
-    """Primer numero dentro de `ventana` caracteres despues de la etiqueta."""
+    """Primer numero REAL dentro de `ventana` caracteres despues de la etiqueta.
+
+    Borra la fecha intercalada antes de buscar, y descarta cualquier numero
+    pegado a un guion o a una diagonal: eso es resto de fecha o de un rango
+    como "1-3yr", nunca el dato.
+    """
     for m in re.finditer(re.escape(etiqueta), texto, re.I):
-        cola = re.sub(r"as of\s+\S+", " ", texto[m.end():m.end() + ventana], flags=re.I)
-        n = re.search(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cola)
-        if n:
+        cola = RE_FECHA_PEGADA.sub(" ", texto[m.end():m.end() + ventana])
+        for n in re.finditer(r"(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?)", cola):
+            if cola[max(0, n.start() - 1):n.start()] in "-/" or cola[n.end():n.end() + 1] in "-/":
+                continue
             v = a_float(n.group(1))
             if v is not None:
                 return v
@@ -117,18 +150,35 @@ def bajar_etf(sesion, etf):
             if v is not None:
                 campos[campo] = v
                 break
-    for rx, fmt in RE_FECHAS:
-        m = rx.search(texto)
+    # La fecha se busca SOLO en el pedazo que sigue a la etiqueta del
+    # rendimiento. Buscarla en toda la pagina traia fechas de avisos legales:
+    # de ahi salio el "31/12/2019" que quedo en los 27 fondos de iShares.
+    ancla = ""
+    for et in ETIQUETAS.get(etf["emisor"], {}).get("ytm", []):
+        m = re.search(re.escape(et), texto, re.I)
         if m:
-            try:
-                campos["fecha"] = datetime.strptime(m.group(1), fmt).date().isoformat()
+            ancla = texto[m.end():m.end() + 60]
+            break
+    for rx, fmt in RE_FECHAS:
+        m = rx.search(ancla)
+        if m:
+            iso = a_fecha(m.group(1), fmt)
+            if iso:
+                campos["fecha"] = iso
                 break
-            except ValueError:
-                pass
+
     # descarta lecturas absurdas antes de que contaminen la base
     for campo, (lo, hi) in LIMITES.items():
         if campo in campos and not (lo <= campos[campo] <= hi):
             campos.pop(campo)
+
+    # Guardia de coherencia: que el rendimiento, la duracion y el vencimiento
+    # salgan identicos es imposible en un fondo real y es la firma exacta de
+    # haber leido tres veces el mismo numero equivocado.
+    trio = [campos.get(k) for k in ("ytm", "duracion", "vto_prom")]
+    if all(v is not None for v in trio) and len(set(trio)) == 1:
+        print("    ! los tres valores salieron iguales (%s): lectura descartada" % trio[0])
+        return {}
     return campos
 
 
@@ -233,6 +283,20 @@ def actualizar(db, pausa=1.2):
             print("SIN DATO -> conservo lo anterior (%s)" % e.get("fecha", "?"))
             fallos += 1
         time.sleep(pausa)
+    # Guardia de flota. Si un mismo rendimiento se repite en mas de un tercio de
+    # los fondos, no son datos: es el raspador leyendo lo mismo una y otra vez.
+    # Mejor abortar y dejar la base anterior intacta que publicar basura.
+    from collections import Counter
+    repes = Counter(round(e["ytm"], 2) for e in db["etfs"])
+    valor, veces = repes.most_common(1)[0]
+    if veces > len(db["etfs"]) / 3:
+        raise SystemExit(
+            "\nABORTADO: %d de %d fondos quedaron con el mismo rendimiento (%.2f%%).\n"
+            "Eso no pasa con datos reales: el raspador esta leyendo mal, seguramente\n"
+            "porque un emisor cambio el formato de su ficha. No se guardo nada; la\n"
+            "base y la pagina anteriores siguen intactas."
+            % (veces, len(db["etfs"]), valor))
+
     db["actualizado"] = date.today().isoformat()
     print("\n  %d actualizados, %d conservados." % (ok, fallos))
     return db, ok
