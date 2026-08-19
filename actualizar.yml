@@ -1,0 +1,83 @@
+name: Actualizar comparador de renta fija
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      # OJO: este paso tiene permitido fallar a proposito. Si no se pudieran
+      # bajar datos nuevos, la pagina TIENE que publicarse igual con los ultimos
+      # datos buenos. Antes iban acoplados: si la descarga fallaba, el sitio
+      # nunca se volvia a publicar y se quedaba congelado en la version vieja.
+      - name: Bajar datos y regenerar el HTML
+        id: datos
+        continue-on-error: true
+        env:
+          BANXICO_TOKEN: ${{ secrets.BANXICO_TOKEN }}
+        run: python actualizar.py --minimo-ok 30
+
+      # Si la descarga fallo, al menos se regenera el HTML con lo que ya habia.
+      - name: Regenerar el HTML de todos modos
+        if: steps.datos.outcome == 'failure'
+        run: python actualizar.py --solo-html
+
+      - name: Guardar cambios en el repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add datos.json renta_fija.html
+          if git diff --staged --quiet; then
+            echo "Sin cambios que guardar."
+          else
+            git commit -m "Datos al $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - name: Preparar el sitio
+        run: |
+          mkdir -p _sitio
+          cp renta_fija.html _sitio/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _sitio
+
+  publicar:
+    needs: actualizar
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # El aviso va al final, DESPUES de publicar: te enteras de que los datos no se
+  # pudieron refrescar, pero el sitio ya quedo actualizado y accesible.
+  avisar:
+    needs: [actualizar, publicar]
+    if: always() && needs.actualizar.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Publicado. Revisa el log del paso 'Bajar datos' por si algun fondo quedo sin refrescar."
