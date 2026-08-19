@@ -138,11 +138,10 @@ def bajar_etf(sesion, etf):
         # de otra pagina cuando la mexicana no las publica en HTML
         r = sesion.get(etf.get("url_datos") or etf["url"], timeout=30)
         if not r.ok:
-            return {}
+            return {"_motivo": "HTTP %s" % r.status_code}
         texto = a_texto(r.text)
     except Exception as e:
-        print("    ! red: %s" % e)
-        return {}
+        return {"_motivo": "error de red: %s" % type(e).__name__}
 
     for campo, etiquetas in ETIQUETAS.get(etf["emisor"], {}).items():
         for et in etiquetas:
@@ -177,8 +176,10 @@ def bajar_etf(sesion, etf):
     # haber leido tres veces el mismo numero equivocado.
     trio = [campos.get(k) for k in ("ytm", "duracion", "vto_prom")]
     if all(v is not None for v in trio) and len(set(trio)) == 1:
-        print("    ! los tres valores salieron iguales (%s): lectura descartada" % trio[0])
-        return {}
+        return {"_motivo": "los tres valores salieron iguales (%s)" % trio[0]}
+    if campos.get("ytm") is None:
+        return {"_motivo": "no encontre la etiqueta del rendimiento"}
+    campos.pop("_motivo", None)
     return campos
 
 
@@ -270,6 +271,7 @@ def actualizar(db, pausa=1.2):
     sesion = requests.Session()
     sesion.headers.update({"User-Agent": UA, "Accept-Language": "en-GB,en;q=0.9"})
     ok = fallos = 0
+    leidos = []
     for e in db["etfs"]:
         print("  %-6s %-52s" % (e["ticker"], e["nombre"][:52]), end="  ")
         nuevos = bajar_etf(sesion, e)
@@ -278,24 +280,28 @@ def actualizar(db, pausa=1.2):
             e["neto"] = round(e["ytm"] - e["ter"], 4)
             e["plazo"] = plazo_de(e["vto_prom"])
             print("OK  tasa %.2f%%  costo %.2f%%  neto %.2f%%" % (e["ytm"], e["ter"], e["neto"]))
+            leidos.append(e["ytm"])
             ok += 1
         else:
-            print("SIN DATO -> conservo lo anterior (%s)" % e.get("fecha", "?"))
+            print("SIN DATO (%s) -> conservo lo anterior (%s)"
+                  % (nuevos.get("_motivo", "no encontre las etiquetas"), e.get("fecha", "?")))
             fallos += 1
         time.sleep(pausa)
-    # Guardia de flota. Si un mismo rendimiento se repite en mas de un tercio de
-    # los fondos, no son datos: es el raspador leyendo lo mismo una y otra vez.
-    # Mejor abortar y dejar la base anterior intacta que publicar basura.
-    from collections import Counter
-    repes = Counter(round(e["ytm"], 2) for e in db["etfs"])
-    valor, veces = repes.most_common(1)[0]
-    if veces > len(db["etfs"]) / 3:
-        raise SystemExit(
-            "\nABORTADO: %d de %d fondos quedaron con el mismo rendimiento (%.2f%%).\n"
-            "Eso no pasa con datos reales: el raspador esta leyendo mal, seguramente\n"
-            "porque un emisor cambio el formato de su ficha. No se guardo nada; la\n"
-            "base y la pagina anteriores siguen intactas."
-            % (veces, len(db["etfs"]), valor))
+    # Guardia de flota: si un mismo rendimiento se repite en mas de un tercio de
+    # lo LEIDO EN ESTA CORRIDA, no son datos, es el raspador repitiendose.
+    # Ojo: solo se juzgan las lecturas nuevas. Si mirara la base completa, unos
+    # datos ya envenenados harian abortar cada corrida futura aunque el raspador
+    # estuviera sano: un candado del que la pagina nunca podria salir sola.
+    if leidos:
+        from collections import Counter
+        valor, veces = Counter(round(v, 2) for v in leidos).most_common(1)[0]
+        if veces > len(leidos) / 3:
+            raise SystemExit(
+                "\nABORTADO: %d de los %d fondos leidos en esta corrida dieron el mismo\n"
+                "rendimiento (%.2f%%). Eso no pasa con datos reales: el raspador esta\n"
+                "leyendo mal, casi seguro porque un emisor cambio su ficha. No se guardo\n"
+                "nada; la base y la pagina anteriores siguen intactas."
+                % (veces, len(leidos), valor))
 
     db["actualizado"] = date.today().isoformat()
     print("\n  %d actualizados, %d conservados." % (ok, fallos))
