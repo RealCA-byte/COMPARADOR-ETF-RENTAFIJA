@@ -2,7 +2,7 @@ name: Actualizar comparador de renta fija
 
 on:
   schedule:
-    - cron: "0 13 * * 1"
+    - cron: "0 13 * * 3"
   workflow_dispatch:
 
 permissions:

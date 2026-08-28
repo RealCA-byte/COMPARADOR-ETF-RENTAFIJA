@@ -256,6 +256,118 @@ def bajar_inflacion(db, sesion):
             print("    ! %s: %s -> conservo %.2f%%" % (divisa, e, inf[divisa]["valor"]))
 
 
+
+# ------------------------------------------------------- tipo de cambio real
+#
+# Convertir el rendimiento de un bono extranjero a pesos exige un supuesto sobre
+# el tipo de cambio. La paridad de poder adquisitivo da un numero teorico; el
+# historico da uno MEDIDO. Ninguno predice el futuro, pero el medido al menos se
+# puede auditar: esto es lo que de verdad paso.
+SIE_RANGO = ("https://www.banxico.org.mx/SieAPIRest/service/v1/series/"
+             "{ids}/datos/{ini}/{fin}")
+
+
+def _serie_diaria(token, serie, anios=11):
+    """Devuelve [(date, valor)] ordenado por fecha."""
+    fin = date.today()
+    ini = date(fin.year - anios, fin.month, fin.day)
+    r = requests.get(SIE_RANGO.format(ids=serie, ini=ini.isoformat(), fin=fin.isoformat()),
+                     headers={"Bmx-Token": token, "Accept": "application/json"}, timeout=60)
+    r.raise_for_status()
+    out = []
+    for d in r.json()["bmx"]["series"][0].get("datos", []):
+        v = a_float(d.get("dato"))
+        if v is None or v <= 0:
+            continue
+        try:
+            out.append((datetime.strptime(d["fecha"], "%d/%m/%Y").date(), v))
+        except ValueError:
+            pass
+    return sorted(out)
+
+
+def _al_dia(serie, objetivo):
+    """Valor mas cercano a `objetivo` sin pasarse (la serie tiene huecos)."""
+    previos = [v for f, v in serie if f <= objetivo]
+    return previos[-1] if previos else None
+
+
+def _anualizado(hoy, antes, anios):
+    """% anual de depreciacion del peso. Positivo = el peso perdio valor."""
+    return ((hoy / antes) ** (1.0 / anios) - 1) * 100
+
+
+def bajar_fx(db):
+    mx = db["mexico"]
+    fx = mx.get("fx")
+    if not fx:
+        return
+    token = os.environ.get("BANXICO_TOKEN", "").strip()
+    if not token:
+        print("  Sin BANXICO_TOKEN: conservo el tipo de cambio guardado.")
+        return
+
+    for divisa in ("USD", "EUR"):
+        conf = fx.get(divisa)
+        if not conf or not conf.get("serie"):
+            continue
+        try:
+            serie = _serie_diaria(token, conf["serie"])
+            if len(serie) < 300:
+                raise RuntimeError("serie demasiado corta (%d datos)" % len(serie))
+        except Exception as e:
+            print("    ! %s: %s -> conservo lo guardado" % (divisa, e))
+            continue
+
+        hoy_f, hoy_v = serie[-1]
+        conf["actual"], conf["fecha"] = round(hoy_v, 4), hoy_f.isoformat()
+        conf["ventanas"] = {}
+        for anios in (1, 3, 5, 10):
+            antes = _al_dia(serie, date(hoy_f.year - anios, hoy_f.month, hoy_f.day))
+            if antes:
+                conf["ventanas"]["%da" % anios] = round(_anualizado(hoy_v, antes, anios), 2)
+        print("    %s FIX %.4f (%s)  ventanas: %s"
+              % (divisa, hoy_v, hoy_f, conf["ventanas"]))
+
+        # La serie diaria sirve para DOS cosas distintas, y conviene no
+        # confundirlas:
+        #   1) el nivel de deriva -> se calcula GEOMETRICAMENTE (arriba). Nunca
+        #      promediando los cambios diarios: ese promedio sobreestima por el
+        #      arrastre de volatilidad, aprox sigma^2/2, y siempre hacia arriba.
+        #   2) la volatilidad -> esa SI sale de los cambios diarios, y es lo que
+        #      permite dar un rango en vez de un numero solo.
+        cambios = [serie[i][1] / serie[i - 1][1] - 1 for i in range(1, len(serie))]
+        if len(cambios) > 250:
+            media = sum(cambios) / len(cambios)
+            var = sum((c - media) ** 2 for c in cambios) / (len(cambios) - 1)
+            conf["vol_anual"] = round((var ** 0.5) * (252 ** 0.5) * 100, 2)
+            # cuanto sobreestimaria el metodo de promediar cambios diarios
+            conf["sesgo_promedio_simple"] = round((((1 + media) ** 252 - 1) * 100)
+                                                  - conf["ventanas"].get("10a", 0), 2)
+            print("      volatilidad anualizada %.1f%%" % conf["vol_anual"])
+
+        # Distribucion de ventanas de 12 meses en los ultimos 10 anios. Esto es
+        # lo que convierte el supuesto en algo auditable: no "creo que el peso
+        # se va a depreciar X", sino "en 10 anios, esto es lo que hizo".
+        if divisa == "USD":
+            porc = sorted(
+                (v / a - 1) * 100
+                for f, v in serie
+                if (a := _al_dia(serie, date(f.year - 1, f.month, f.day))) and f.year >= hoy_f.year - 10
+            )
+            if len(porc) > 200:
+                def pct(q):
+                    return round(porc[int(q * (len(porc) - 1))], 2)
+                mx["fx"]["rolling"] = {
+                    "n": len(porc), "p10": pct(.10), "p25": pct(.25),
+                    "mediana": pct(.50), "p75": pct(.75), "p90": pct(.90),
+                    "muestras": [round(x, 2) for x in porc],
+                }
+                print("      ventanas de 12m: mediana %+.2f%%  (p25 %+.2f / p75 %+.2f, n=%d)"
+                      % (pct(.50), pct(.25), pct(.75), len(porc)))
+    fx["actualizado"] = date.today().isoformat()
+
+
 def plazo_de(vto):
     """vto viene en anios; las etiquetas se muestran en meses."""
     if vto < 1:
@@ -387,10 +499,10 @@ PLANTILLA = r"""<!DOCTYPE html>
   /* las dos tablas son anchas: se deja respirar a las columnas de texto y se
      aprieta el resto para que quepan sin scroll horizontal en pantalla normal */
   th,td{padding:8px 7px}
-  #t1 td:nth-child(2){white-space:normal;max-width:300px;line-height:1.32}
+  #t1 td:nth-child(2){white-space:normal;max-width:215px;line-height:1.32}
   #t3 td:nth-child(2){white-space:normal;max-width:250px;line-height:1.3}
   #t3 td:nth-child(9),#t3 th:nth-child(9){white-space:normal;max-width:175px;line-height:1.3}
-  #t1 th:nth-child(11),#t1 td:nth-child(11){max-width:150px;white-space:normal;line-height:1.3}
+  #t1 th:nth-child(11),#t1 td:nth-child(11){max-width:145px;white-space:normal;line-height:1.3}
   .vacio{color:var(--muted);padding:24px 0;text-align:center}
 
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
@@ -502,12 +614,12 @@ PLANTILLA = r"""<!DOCTYPE html>
   <div class="scroll"><table id="t1"><thead><tr>
     <th data-k="ticker" class="izq">Ticker</th>
     <th data-k="nombre" class="izq">Nombre</th>
-    <th data-k="ytm">Tasa anual %</th>
+    <th data-k="precio">Precio</th>
+    <th data-k="ytm">Tasa %</th>
     <th data-k="vto_prom">Vto. (meses)</th>
     <th data-k="vto_prom" class="izq">Plazo</th>
     <th data-k="ter">Costo %</th>
-    <th data-k="neto" class="act">Tasa neta %</th>
-    <th data-k="divisa">Divisa</th>
+    <th data-k="neto" class="act">Neta %</th>
     <th data-k="tipo" class="izq">Tipo</th>
     <th data-k="subtipo" class="izq">Subtipo</th>
     <th data-k="calificacion" class="izq">Calificación</th>
@@ -539,17 +651,10 @@ PLANTILLA = r"""<!DOCTYPE html>
 <!-- ============ 3. COMPARATIVA CONTRA CETES ============ -->
 <div class="panel">
   <h2>3. Comparativa contra CETES</h2>
-  <p class="hint">Todo está en <b>rendimiento real y en pesos</b>: se convierte a MXN con la depreciación esperada del peso
-     y se le descuenta la inflación mexicana. Así se compara lo único que importa para ti — cuánto poder de compra ganas al año.
-     Las líneas punteadas moradas son la curva de CETES en esos mismos términos; la línea gris del 0% es el punto donde
-     apenas empatas con la inflación.</p>
-  <div class="filters" style="margin-bottom:10px">
-    <div class="f"><label>Depreciación esperada del peso vs USD (% anual)</label>
-      <input type="number" id="d-usd" step="0.1"></div>
-    <div class="f"><label>vs EUR (% anual)</label>
-      <input type="number" id="d-eur" step="0.1"></div>
-    <button class="btn" id="ppp">Volver a paridad de inflación</button>
-  </div>
+  <p class="hint">Cada punto es un ETF: <b>rendimiento real</b> en el eje vertical — la tasa neta menos la inflación
+     mexicana — y vencimiento promedio en el horizontal. Las líneas punteadas moradas son la curva de CETES en los mismos
+     términos. La línea gris del 0% es el umbral que importa: <b>debajo de ella pierdes poder de compra</b>.
+     Pasa el cursor sobre un punto para ver el detalle.</p>
   <p class="hint" id="nota-infl" style="margin:0 0 12px"></p>
   <div class="curva" id="curva"></div>
   <div class="leyenda" id="leyenda-g"></div>
@@ -596,6 +701,9 @@ const $ = id => document.getElementById(id);
 // "UCITS ETF" aparece en los 39 nombres: quitarlo de la vista gana media columna.
 const corto = n => n.replace(/\s*UCITS ETF\s*/," ").replace(/\s+/g," ").trim();
 const emisorCorto = e => e.replace(" (BlackRock)","");
+// El precio SI se convierte con el tipo de cambio del dia: es un monto, no una tasa.
+const TC = d => ((MX.fx||{})[d]||{}).actual || null;
+const enMXN = (v,d) => { const t=TC(d); return t ? (v*t).toLocaleString("es-MX",{minimumFractionDigits:2,maximumFractionDigits:2}) : "—"; };
 const plazoCorto = p => p.replace(/\s*\(.*\)/,"");
 const n2 = v => (v==null || isNaN(v)) ? "—" : v.toFixed(2);
 // El vencimiento promedio se guarda en anios y se muestra siempre en meses.
@@ -613,8 +721,28 @@ let ref = MX.referencias.find(r=>r.clave==="cetes364") || MX.referencias[0];
    menos que EE.UU., la teoria dice que el peso deberia apreciarse, no perder.
    Es un SUPUESTO, no un dato: por eso los dos campos son editables. */
 const INFL = MX.inflaciones;
+const FX = MX.fx || {};
 const pppDe = c => c==="MXN" ? 0 : ((1+INFL.MXN.valor/100)/(1+INFL[c].valor/100)-1)*100;
-let deprec = {MXN:0, USD:pppDe("USD"), EUR:pppDe("EUR")};
+
+// Los modos de supuesto cambiario, del mas medido al mas libre. "Observado" son
+// datos del FIX de Banxico: lo que el peso hizo de verdad. No predice nada, pero
+// se puede auditar, que es mas de lo que puede decir un supuesto teorico.
+function ventana(c, k){ return ((FX[c]||{}).ventanas||{})[k]; }
+
+// Tres capas fijas, sin campos que llenar. La misma tabla vista bajo tres
+// supuestos distintos: la conclusion cambia mucho segun cual elijas, y eso es
+// justamente lo que hay que ver.
+// Una sola base: el peso se queda donde esta. Es una decision deliberada, no un
+// descuido. En un plan de renta fija lo que se compara es la tasa; meterle un
+// supuesto cambiario con 11% de volatilidad anual convierte una decision sobre
+// credito, duracion y costo en una apuesta sobre el tipo de cambio.
+// El tipo de cambio sigue usandose para convertir PRECIOS, que si son montos.
+const CAPAS = [
+  {id:"cero", txt:"Sin movimiento del peso", usd:0, eur:0},
+];
+let modo = "cero";
+const modoDe = id => CAPAS.find(m=>m.id===id) || CAPAS[0];
+let deprec = {MXN:0, USD:modoDe(modo).usd, EUR:modoDe(modo).eur};
 function realMXN(neto, divisa){
   const d = (deprec[divisa] || 0)/100;
   return ((1+neto/100)*(1+d)/(1+INFL.MXN.valor/100) - 1)*100;
@@ -657,12 +785,13 @@ function tabla1(){
     <td class="izq"><span class="dot" style="background:var(${COLOR[e.familia]})"></span>
         <a class="tk" href="${e.url}" target="_blank" rel="noopener">${e.ticker}</a></td>
     <td class="izq" title="${e.nombre}">${corto(e.nombre)}<div class="sub2">${e.isin} · ${emisorCorto(e.emisor)}</div></td>
+    <td>${e.precio!=null ? n2(e.precio)+" "+e.divisa : "—"}
+        <div class="sub2">${e.precio!=null ? "$"+enMXN(e.precio,e.divisa)+" MXN" : ""}</div></td>
     <td>${n2(e.ytm)}</td>
     <td>${n0(meses(e.vto_prom))}</td>
     <td class="izq"><span class="pill" title="${e.plazo}">${plazoCorto(e.plazo)}</span></td>
     <td>${n2(e.ter)}</td>
     <td class="big pos">${n2(e.neto)}</td>
-    <td>${e.divisa}</td>
     <td class="izq">${e.tipo}</td>
     <td class="izq">${e.subtipo}</td>
     <td class="izq">${e.calificacion}${e.calif_fuente==="mandato"?'<span class="asterisco">m</span>':""}</td>
@@ -857,22 +986,18 @@ $("p-ref").addEventListener("change",()=>{
 
 /* ---------------- 3. GRAFICA COMPARATIVA ---------------- */
 function notaInflacion(){
-  $("d-usd").value = deprec.USD.toFixed(2);
-  $("d-eur").value = deprec.EUR.toFixed(2);
+  const m = modoDe(modo);
   const l = c=>`<a href="${INFL[c].url}" target="_blank" rel="noopener" style="color:inherit">${c} ${n2(INFL[c].valor)}%</a>`;
+  const fxu = FX.USD||{}, fxe = FX.EUR||{};
   $("nota-infl").innerHTML =
-    `Inflación anual (fuente: Trading Economics, julio 2026): <b>${l("MXN")}</b> · ${l("USD")} · ${l("EUR")}.
-     Por paridad de poder adquisitivo el peso se movería ${n2(pppDe("USD"))}% contra el dólar y ${n2(pppDe("EUR"))}% contra el euro:
-     como México inflaciona menos que Estados Unidos, la teoría dice que el peso debería <b>apreciarse</b>, no perder.
-     Es un supuesto, no un dato — cámbialo arriba si tienes otra expectativa.`;
+    `<b>Base: el tipo de cambio se queda donde está.</b> A cada ETF se le descuenta la inflación
+     mexicana (${n2(INFL.MXN.valor)}%) y nada más. La pregunta que responde la gráfica es una sola:
+     <em>¿esta tasa le gana a la inflación de aquí, y le gana a un CETE?</em>
+     Sin supuestos cambiarios de por medio.
+     <br>Tipo de cambio FIX de Banxico al ${fxu.fecha||"—"}: <b>${n2(fxu.actual)}</b> por dólar,
+     <b>${n2(fxe.actual)}</b> por euro — sólo se usa para convertir los <em>precios</em> de la tabla.
+     Inflación (Trading Economics): ${l("MXN")} · ${l("USD")} · ${l("EUR")}.`;
 }
-$("d-usd").addEventListener("input",()=>{
-  const v=parseFloat($("d-usd").value); if(!isNaN(v)){ deprec.USD=v; grafica(); pintarPortafolio(); }});
-$("d-eur").addEventListener("input",()=>{
-  const v=parseFloat($("d-eur").value); if(!isNaN(v)){ deprec.EUR=v; grafica(); pintarPortafolio(); }});
-$("ppp").addEventListener("click",()=>{
-  deprec.USD=pppDe("USD"); deprec.EUR=pppDe("EUR"); todo();
-});
 
 function curva(){
   $("curva").innerHTML = MX.referencias.map(r=>`
@@ -929,7 +1054,7 @@ function grafica(){
   });
   g+=`<line class="ax" x1="${m.l}" x2="${W-m.r}" y1="${m.t+ih}" y2="${m.t+ih}"/>`;
   g+=`<text class="axlab" x="${m.l+iw/2}" y="${H-14}" text-anchor="middle">Vencimiento promedio (meses)</text>`;
-  g+=`<text class="axlab" transform="rotate(-90 16 ${m.t+ih/2})" x="16" y="${m.t+ih/2}" text-anchor="middle">Rendimiento real en pesos (% anual)</text>`;
+  g+=`<text class="axlab" transform="rotate(-90 16 ${m.t+ih/2})" x="16" y="${m.t+ih/2}" text-anchor="middle">Rendimiento real (tasa neta − inflación MXN)</text>`;
   // la linea del 0% es el umbral de conservar poder de compra
   g+=`<line x1="${m.l}" x2="${W-m.r}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}" stroke="var(--axis)" stroke-width="1.5"/>`;
   g+=`<text class="tick" x="${W-m.r}" y="${(Y(0)+15).toFixed(1)}" text-anchor="end">0% = empatas con la inflación</text>`;
@@ -968,12 +1093,11 @@ function grafica(){
   svg.querySelectorAll("g[data-i]").forEach(node=>{
     const e=ETFS[+node.dataset.i];
     node.addEventListener("mousemove",ev=>{
-      const r=realMXN(e.neto,e.divisa), brecha=r-refReal(), d=deprec[e.divisa]||0;
+      const r=realMXN(e.neto,e.divisa), brecha=r-refReal();
       tip.innerHTML=`<b>${e.ticker} — ${corto(e.nombre)}</b>
         <i>${e.familia} · ${e.divisa} · ${e.calificacion}</i><br>
         Neto en ${e.divisa}: <b style="display:inline">${n2(e.neto)}%</b><br>
-        ${e.divisa==="MXN" ? "" : `Peso ${d>=0?"pierde":"gana"} ${n2(Math.abs(d))}% &rarr; ${n2(((1+e.neto/100)*(1+d/100)-1)*100)}% en MXN<br>`}
-        Menos inflación ${n2(INFL.MXN.valor)}% &rarr;
+        Menos inflación mexicana ${n2(INFL.MXN.valor)}% &rarr;
         <b style="display:inline;color:${r>=0?"var(--good)":"var(--alerta)"}">${n2(r)}% real</b><br>
         Contra ${ref.nombre} (${n2(refReal())}% real):
         <b style="display:inline;color:${brecha>=0?"var(--good)":"var(--alerta)"}">${brecha>=0?"+":""}${n2(brecha)} pp</b><br>
